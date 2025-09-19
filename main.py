@@ -4,45 +4,71 @@ import time
 import datetime
 import pandas as pd
 import yfinance as yf
-from neo_api_client import NeoAPI
+from neo_api_client import NeoAPI, BaseUrl
 import schedule
 import logging
 
 # --- Start of User Configuration ---
+# IMPORTANT: Do not commit this file with your credentials filled in.
+# Keep this information secure and do not share it.
 
 # 1. Kotak Neo API Credentials
-# IMPORTANT: Fill in your actual credentials below.
-# You can get these from the Kotak Securities developer portal.
-# Keep this information secure and do not share it.
 CONSUMER_KEY = "your_consumer_key"
 CONSUMER_SECRET = "your_consumer_secret"
-NEO_FIN_KEY = "your_neo_fin_key"  # Received via email upon API registration
+NEO_FIN_KEY = "your_neo_fin_key"
 
 # 2. User Account Details
-# IMPORTANT: Fill in your account details for login.
-UCC = "your_ucc"  # Your Unique Client Code (UCC)
-MOBILE_NUMBER = "your_10_digit_mobile_number" # Your registered 10-digit mobile number
-MPIN = "your_4_digit_mpin"  # Your MPIN for the Kotak Neo platform
-PASSWORD = "your_password" # Your password for the Kotak Neo platform
+UCC = "your_ucc"
+MOBILE_NUMBER = "your_10_digit_mobile_number"
+MPIN = "your_4_digit_mpin"
 
 # 3. Strategy Parameters
-# Define the underlying index and trading parameters.
-INDEX_SYMBOL = "^NSEI"  # Yahoo Finance ticker for the index (e.g., ^NSEI for Nifty 50, ^BSESN for Sensex)
-TRADING_SYMBOL_PREFIX = "NIFTY" # The prefix for the trading symbol (e.g., NIFTY, BANKNIFTY)
-STRIKE_DIFFERENCE = 50  # The difference between strike prices (e.g., 50 for Nifty, 100 for Bank Nifty)
-PRODUCT_TYPE = "NRML"  # Product type: NRML (Normal), MIS (Intraday)
-QUANTITY = 50  # The quantity to trade (e.g., one lot size)
+INDEX_SYMBOL = "^NSEBANK"
+TRADING_SYMBOL_PREFIX = "BANKNIFTY"
+STRIKE_DIFFERENCE = 100
+PRODUCT_TYPE = "MIS"
+LOT_SIZE = 15 # Bank Nifty lot size
+NUM_LOTS = 1
+QUANTITY = LOT_SIZE * NUM_LOTS
+STOP_LOSS_AMOUNT = -750.0
 
 # 4. Bot Timings
-# Define the trading window for the bot.
-ENTRY_TIME = "09:30"
+ENTRY_TIME = "09:16" # Start collecting data after the 9:15 candle opens
+TRADING_START_TIME = "09:30" # Start executing trading logic
 EXIT_TIME = "15:00"
 
 # --- End of User Configuration ---
 
 # --- Global Variables ---
 client = None
-open_positions = []
+bot_state = {}
+price_data = pd.DataFrame(columns=['timestamp', 'combined_premium'])
+
+def reset_bot_state():
+    """Initializes or resets the bot's state for the day."""
+    global bot_state, price_data
+    bot_state = {
+        "straddle_selected": False,
+        "initial_entry_taken": False,
+        "is_trading_window_open": False,
+        "premium_crossed_above_twap": False,
+
+        "call_instrument": None,
+        "put_instrument": None,
+
+        "call_leg_open": False,
+        "put_leg_open": False,
+
+        "call_entry_price": 0.0,
+        "put_entry_price": 0.0,
+
+        "call_re_entry_used": False,
+        "put_re_entry_used": False,
+
+        "entry_index_ltp": None,
+    }
+    price_data = pd.DataFrame(columns=['timestamp', 'combined_premium'])
+    logging.info("Bot state has been reset for the day.")
 
 # --- Main Logic ---
 
@@ -57,34 +83,25 @@ def login_to_kotak():
     """Handles the login process for the Kotak Neo API."""
     global client
     try:
-        client = NeoAPI(consumer_key=CONSUMER_KEY,
-                        consumer_secret=CONSUMER_SECRET,
-                        environment='prod') # Use 'uat' for testing if available
-
-        # Step 1: TOTP Login
+        base_url = BaseUrl(UCC).get_base_url()
+        client = NeoAPI(consumer_key=CONSUMER_KEY, consumer_secret=CONSUMER_SECRET, environment='prod', base_url=base_url)
         totp = input("Enter the TOTP from your authenticator app: ")
         client.totp_login(mobile_number=MOBILE_NUMBER, ucc=UCC, totp=totp)
         logging.info("TOTP Login successful.")
-
-        # Step 2: Validate session with MPIN
         client.totp_validate(mpin=MPIN)
         logging.info("Session validated with MPIN. Login complete.")
         return True
-
     except Exception as e:
         logging.error(f"Failed to login to Kotak Neo API: {e}")
         return False
 
-# --- Trading Strategy Functions ---
+# --- Data and Instrument Functions ---
 
 def get_index_ltp(symbol):
     """Fetches the Last Traded Price of the index from yfinance."""
     try:
-        ticker = yf.Ticker(symbol)
-        # Use "1d" period and "1m" interval to get the most recent data point
-        data = ticker.history(period="1d", interval="1m")
+        data = yf.Ticker(symbol).history(period="1d", interval="1m")
         ltp = data['Close'].iloc[-1]
-        logging.info(f"LTP for {symbol} is {ltp:.2f}")
         return ltp
     except Exception as e:
         logging.error(f"Could not fetch LTP for {symbol}: {e}")
@@ -95,41 +112,16 @@ def get_atm_strike(ltp):
     return round(ltp / STRIKE_DIFFERENCE) * STRIKE_DIFFERENCE
 
 def get_weekly_expiry_date():
-    """
-    Calculates the nearest weekly expiry date (Thursday).
-    If today is Thursday and before market close, it's today.
-    If today is after Thursday, it's next Thursday.
-    """
+    """Calculates the nearest weekly expiry date (Thursday)."""
     today = datetime.date.today()
-    # Thursday is weekday 3 (0=Monday, 1=Tuesday, ..., 6=Sunday)
     days_ahead = (3 - today.weekday() + 7) % 7
-    expiry_date = today + datetime.timedelta(days=days_ahead)
-    return expiry_date
+    return today + datetime.timedelta(days=days_ahead)
 
 def get_option_instrument(strike_price, option_type):
-    """
-    Finds the instrument token and trading symbol for a given option.
-
-    Args:
-        strike_price (int): The strike price of the option.
-        option_type (str): 'CE' for Call Option, 'P' for Put Option.
-
-    Returns:
-        dict: A dictionary containing 'token' and 'symbol', or None.
-    """
+    """Finds the instrument token and trading symbol for a given option."""
     try:
-        expiry_date = get_weekly_expiry_date()
-        # Format for search_scrip: DDMMMYY, e.g., 26SEP24
-        expiry_str = expiry_date.strftime('%d%b%y').upper()
-
-        search_result = client.search_scrip(
-            exchange_segment="nse_fo",
-            symbol=TRADING_SYMBOL_PREFIX,
-            expiry=expiry_str,
-            option_type=option_type,
-            strike_price=str(strike_price)
-        )
-
+        expiry_str = get_weekly_expiry_date().strftime('%d%b%y').upper()
+        search_result = client.search_scrip(exchange_segment="nse_fo", symbol=TRADING_SYMBOL_PREFIX, expiry=expiry_str, option_type=option_type, strike_price=str(strike_price))
         if search_result and search_result['data']:
             instrument = search_result['data'][0]
             logging.info(f"Found instrument for {strike_price} {option_type}: {instrument['tsym']}")
@@ -144,47 +136,74 @@ def get_option_instrument(strike_price, option_type):
 def get_option_premiums(call_instrument, put_instrument):
     """Fetches the premiums (LTP) for the given call and put options."""
     try:
-        instruments_to_fetch = [
-            {"instrument_token": call_instrument['token'], "exchange_segment": "nse_fo"},
-            {"instrument_token": put_instrument['token'], "exchange_segment": "nse_fo"}
-        ]
+        instruments = []
+        if call_instrument:
+            instruments.append({"instrument_token": call_instrument['token'], "exchange_segment": "nse_fo"})
+        if put_instrument:
+            instruments.append({"instrument_token": put_instrument['token'], "exchange_segment": "nse_fo"})
 
-        quote_response = client.quotes(instrument_tokens=instruments_to_fetch, quote_type="ltp")
+        quote_response = client.quotes(instrument_tokens=instruments, quote_type="ltp")
+
+        call_premium = None
+        put_premium = None
 
         if quote_response and quote_response.get('data'):
-            call_premium = None
-            put_premium = None
-            for item in quote_response['data']:
-                if item.get('instrument_token') == call_instrument['token']:
-                    call_premium = float(item.get('last_traded_price', 0))
-                if item.get('instrument_token') == put_instrument['token']:
-                    put_premium = float(item.get('last_traded_price', 0))
-
-            if call_premium is not None and put_premium is not None:
-                logging.info(f"Premiums: Call={call_premium}, Put={put_premium}")
-                return call_premium, put_premium
+            if call_instrument:
+                call_premium = next((float(item.get('last_traded_price', 0)) for item in quote_response['data'] if item.get('instrument_token') == call_instrument['token']), None)
+            if put_instrument:
+                put_premium = next((float(item.get('last_traded_price', 0)) for item in quote_response['data'] if item.get('instrument_token') == put_instrument['token']), None)
+            return call_premium, put_premium
 
         logging.error("Could not fetch premiums from quote response.")
         return None, None
-
     except Exception as e:
         logging.error(f"Error fetching option premiums: {e}")
         return None, None
 
+# --- Core Strategy Logic ---
+
+def initial_setup():
+    """Runs once at the start of the session to determine the ATM straddle."""
+    logging.info("--- Running Initial Setup for 9:16 AM ---")
+    ltp = get_index_ltp(INDEX_SYMBOL)
+    if ltp is None:
+        logging.error("Could not get LTP to determine ATM strike. Setup failed.")
+        return
+    atm_strike = get_atm_strike(ltp)
+    logging.info(f"ATM Strike determined to be: {atm_strike}")
+    bot_state['call_instrument'] = get_option_instrument(atm_strike, 'CE')
+    bot_state['put_instrument'] = get_option_instrument(atm_strike, 'P')
+    if not bot_state['call_instrument'] or not bot_state['put_instrument']:
+        logging.error("Could not find instruments for one or both options. Setup failed.")
+        return
+    bot_state['straddle_selected'] = True
+    logging.info(f"Straddle selected: {bot_state['call_instrument']['symbol']} and {bot_state['put_instrument']['symbol']}")
+    return schedule.CancelJob
+
+def update_and_calculate_twap():
+    """
+    Fetches premiums and calculates the TWAP for the straddle.
+    Note: TWAP (Time-Weighted Average Price) is used as a practical proxy for VWAP
+    (Volume-Weighted Average Price) because per-minute volume data for a combined,
+    synthetic instrument like a straddle is not readily available.
+    """
+    if not bot_state.get('straddle_selected'):
+        return None, None, None, None
+    call_premium, put_premium = get_option_premiums(bot_state['call_instrument'], bot_state['put_instrument'])
+    if call_premium is None or put_premium is None:
+        return None, None, None, None
+    combined_premium = call_premium + put_premium
+    global price_data
+    new_row = pd.DataFrame({'timestamp': [datetime.datetime.now()], 'combined_premium': [combined_premium]})
+    price_data = pd.concat([price_data, new_row], ignore_index=True)
+    premium_twap = price_data['combined_premium'].mean()
+    logging.info(f"Premiums C:{call_premium:.2f}, P:{put_premium:.2f} | Combined:{combined_premium:.2f} | TWAP:{premium_twap:.2f}")
+    return call_premium, put_premium, combined_premium, premium_twap
+
 def place_order(trading_symbol, transaction_type):
-    """Places a sell order."""
+    """Places a market order."""
     try:
-        order_response = client.place_order(
-            exchange_segment="nse_fo",
-            product=PRODUCT_TYPE,
-            price="0", # Market order
-            order_type="MKT",
-            quantity=str(QUANTITY),
-            validity="DAY",
-            trading_symbol=trading_symbol,
-            transaction_type=transaction_type, # 'S' for sell, 'B' for buy
-            amo="NO"
-        )
+        order_response = client.place_order(exchange_segment="nse_fo", product=PRODUCT_TYPE, price="0", order_type="MKT", quantity=str(QUANTITY), validity="DAY", trading_symbol=trading_symbol, transaction_type=transaction_type, amo="NO")
         if order_response and order_response.get('data', {}).get('order_id'):
             order_id = order_response['data']['order_id']
             logging.info(f"Successfully placed {transaction_type} order for {trading_symbol}. Order ID: {order_id}")
@@ -196,76 +215,135 @@ def place_order(trading_symbol, transaction_type):
         logging.error(f"Exception placing {transaction_type} order for {trading_symbol}: {e}")
         return None
 
+def check_for_entry(call_premium, put_premium, combined_premium, premium_twap):
+    """
+    Checks and executes the entry logic based on Rules 3, 4, 12, 13.
+    Note: The "on candle close" basis (Rule 13) is implemented by checking the state
+    every minute. On a 1-minute timeframe, this is a robust and practical proxy.
+    """
+    if not bot_state['premium_crossed_above_twap']:
+        if combined_premium > premium_twap:
+            bot_state['premium_crossed_above_twap'] = True
+            logging.info("Condition met: Premium crossed above TWAP. Now monitoring for an entry signal.")
+        else:
+            logging.info("Condition not met: Premium is still below TWAP. Waiting for it to cross above before entry.")
+        return
+
+    if combined_premium < premium_twap:
+        logging.info(f"ENTRY SIGNAL: Premium ({combined_premium:.2f}) < TWAP ({premium_twap:.2f}).")
+        entry_ltp = get_index_ltp(INDEX_SYMBOL)
+        if entry_ltp is None:
+            logging.error("Could not get index LTP at entry. Cannot proceed with entry.")
+            return
+        logging.info("Attempting to sell ATM straddle...")
+        call_order_id = place_order(bot_state['call_instrument']['symbol'], 'S')
+        put_order_id = place_order(bot_state['put_instrument']['symbol'], 'S')
+        if call_order_id and put_order_id:
+            logging.info("Successfully sold straddle.")
+            bot_state.update({"initial_entry_taken": True, "call_leg_open": True, "put_leg_open": True,
+                              "call_entry_price": call_premium, "put_entry_price": put_premium,
+                              "entry_index_ltp": entry_ltp})
+        else:
+            logging.error("Failed to place one or both sell orders for straddle entry.")
+
+def calculate_legs_pnl(current_call_premium, current_put_premium):
+    """Calculates the P&L for each open leg based on entry price."""
+    pnl = {"call": 0.0, "put": 0.0, "total": 0.0}
+    if bot_state['call_leg_open']:
+        # For a short position, P&L = (entry_price - current_price) * quantity
+        pnl["call"] = (bot_state['call_entry_price'] - current_call_premium) * QUANTITY
+    if bot_state['put_leg_open']:
+        pnl["put"] = (bot_state['put_entry_price'] - current_put_premium) * QUANTITY
+    pnl["total"] = pnl["call"] + pnl["put"]
+    return pnl
+
+def manage_open_positions(call_premium, put_premium, combined_premium, premium_twap):
+    """Manages open positions based on the user's rules."""
+    pnl = calculate_legs_pnl(call_premium, put_premium)
+    logging.info(f"P&L Check: Call P&L: {pnl['call']:.2f}, Put P&L: {pnl['put']:.2f}, Total P&L: {pnl['total']:.2f}")
+
+    # Stop-Loss Logic (Rules 5, 6, 14)
+    if combined_premium > premium_twap:
+        if pnl['total'] > STOP_LOSS_AMOUNT:
+            logging.info(f"Premium > TWAP, but loss ({pnl['total']:.2f}) is within threshold of {STOP_LOSS_AMOUNT}.")
+            return
+
+        logging.warning(f"STOP LOSS triggered. Premium > TWAP and P&L ({pnl['total']:.2f}) has breached {STOP_LOSS_AMOUNT}.")
+
+        # Determine market direction to decide which leg to close (Rules 5 & 6)
+        current_ltp = get_index_ltp(INDEX_SYMBOL)
+        entry_ltp = bot_state.get('entry_index_ltp')
+
+        if current_ltp is None or entry_ltp is None:
+            logging.error("Cannot determine market direction. Skipping leg closing.")
+            return
+
+        # Rule 5: If market is moving up, close the call option
+        if current_ltp > entry_ltp and bot_state['call_leg_open']:
+            logging.info("Market is up. Closing CALL leg as per Rule 5.")
+            place_order(bot_state['call_instrument']['symbol'], 'B')
+            bot_state['call_leg_open'] = False
+
+        # Rule 6: If market is moving down, close the put option
+        elif current_ltp <= entry_ltp and bot_state['put_leg_open']:
+            logging.info("Market is down. Closing PUT leg as per Rule 6.")
+            place_order(bot_state['put_instrument']['symbol'], 'B')
+            bot_state['put_leg_open'] = False
+
+    # Re-entry Logic (Rule 7)
+    elif combined_premium < premium_twap:
+        if not bot_state['call_leg_open'] and not bot_state['call_re_entry_used']:
+            logging.info("RE-ENTRY signal for CALL leg. Premium has gone back below TWAP.")
+            new_call_price, _ = get_option_premiums(bot_state['call_instrument'], None)
+            if new_call_price:
+                place_order(bot_state['call_instrument']['symbol'], 'S')
+                bot_state.update({"call_leg_open": True, "call_re_entry_used": True, "call_entry_price": new_call_price})
+
+        if not bot_state['put_leg_open'] and not bot_state['put_re_entry_used']:
+            logging.info("RE-ENTRY signal for PUT leg. Premium has gone back below TWAP.")
+            _, new_put_price = get_option_premiums(None, bot_state['put_instrument'])
+            if new_put_price:
+                place_order(bot_state['put_instrument']['symbol'], 'S')
+                bot_state.update({"put_leg_open": True, "put_re_entry_used": True, "put_entry_price": new_put_price})
+
 def run_strategy():
     """The main function that executes the trading strategy logic."""
-    # Only run if we haven't entered a position yet
-    if open_positions:
-        logging.info("Positions are already open. Skipping entry check.")
+    current_time = datetime.datetime.now().strftime("%H:%M")
+    logging.info(f"--- Running Strategy Check at {current_time} ---")
+
+    if not bot_state.get('straddle_selected'):
+        logging.info("Straddle not selected yet. Waiting for 9:16 AM setup.")
         return
 
-    logging.info("--- Running Strategy Check ---")
-
-    # Get Index LTP and calculate ATM strike
-    ltp = get_index_ltp(INDEX_SYMBOL)
-    if ltp is None:
+    call_premium, put_premium, combined_premium, premium_twap = update_and_calculate_twap()
+    if combined_premium is None:
         return
 
-    atm_strike = get_atm_strike(ltp)
-    logging.info(f"ATM Strike determined to be: {atm_strike}")
+    if not bot_state['is_trading_window_open'] and current_time >= TRADING_START_TIME:
+        logging.info(f"--- TRADING WINDOW IS NOW OPEN ({TRADING_START_TIME}) ---")
+        bot_state['is_trading_window_open'] = True
 
-    # Get instruments for ATM call and put
-    call_instrument = get_option_instrument(atm_strike, 'CE')
-    put_instrument = get_option_instrument(atm_strike, 'P')
-
-    if not call_instrument or not put_instrument:
-        logging.error("Could not find instruments for one or both options. Halting strategy check.")
+    if not bot_state['is_trading_window_open']:
+        logging.info("Data collection phase (pre-9:30 AM). No trading will be executed.")
         return
 
-    # Get premiums
-    call_premium, put_premium = get_option_premiums(call_instrument, put_instrument)
-    if call_premium is None or put_premium is None:
-        logging.error("Could not fetch premiums. Halting strategy check.")
-        return
-
-    combined_premium = call_premium + put_premium
-    logging.info(f"Combined Premium: {combined_premium:.2f}")
-
-    # Get VWAP
-    vwap = calculate_vwap(INDEX_SYMBOL)
-    if vwap is None:
-        logging.error("Could not calculate VWAP. Halting strategy check.")
-        return
-
-    # Check entry condition
-    if vwap <= combined_premium:
-        logging.info("Entry condition met: VWAP <= Combined Premium.")
-        logging.info(f"Attempting to sell ATM strangle: {call_instrument['symbol']} and {put_instrument['symbol']}")
-
-        # Place sell orders
-        call_order_id = place_order(call_instrument['symbol'], 'S')
-        put_order_id = place_order(put_instrument['symbol'], 'S')
-
-        if call_order_id and put_order_id:
-            global open_positions
-            open_positions = [call_instrument, put_instrument]
-            logging.info("Successfully sold strangle. Now monitoring for exit time.")
-            # Stop trying to enter more positions for today
-            schedule.clear('entry-job')
-        else:
-            logging.error("Failed to place one or both sell orders.")
+    if bot_state.get('initial_entry_taken'):
+        manage_open_positions(call_premium, put_premium, combined_premium, premium_twap)
     else:
-        logging.info(f"Entry condition not met: VWAP ({vwap:.2f}) > Combined Premium ({combined_premium:.2f})")
+        check_for_entry(call_premium, put_premium, combined_premium, premium_twap)
 
 def square_off_positions():
     """Squares off any open positions and logs out."""
-    global open_positions
     logging.info("--- Initiating Square Off ---")
-    if not open_positions:
-        logging.info("No open positions to square off.")
-    else:
-        for position in open_positions:
-            logging.info(f"Squaring off {position['symbol']}...")
-            place_order(position['symbol'], 'B') # 'B' for Buy to square off
+    if bot_state.get('call_leg_open'):
+        logging.info(f"Squaring off {bot_state['call_instrument']['symbol']}...")
+        place_order(bot_state['call_instrument']['symbol'], 'B')
+    if bot_state.get('put_leg_open'):
+        logging.info(f"Squaring off {bot_state['put_instrument']['symbol']}...")
+        place_order(bot_state['put_instrument']['symbol'], 'B')
+
+    logging.info("Waiting a moment for square-off orders to execute...")
+    time.sleep(5)
 
     try:
         if client:
@@ -273,80 +351,28 @@ def square_off_positions():
             logging.info("Successfully logged out.")
     except Exception as e:
         logging.error(f"Error during logout: {e}")
-
     logging.info("Trading bot has finished its tasks for the day.")
-    # Stop the schedule loop
     return schedule.CancelJob
-
-
-def calculate_vwap(symbol):
-    """
-    Calculates the Volume Weighted Average Price (VWAP) for a given symbol.
-
-    Args:
-        symbol (str): The stock symbol (ticker) for which to calculate VWAP.
-                      For yfinance, use tickers like '^NSEI' for Nifty 50.
-
-    Returns:
-        float: The calculated VWAP, or None if calculation fails.
-    """
-    try:
-        # Download intraday data for the current day (period="1d") with a 1-minute interval
-        data = yf.download(tickers=symbol, period="1d", interval="1m", progress=False)
-
-        if data.empty:
-            logging.warning(f"No data returned for {symbol}. It might be a holiday or pre-market.")
-            return None
-
-        # Calculate typical price and the cumulative values for VWAP
-        data['TypicalPrice'] = (data['High'] + data['Low'] + data['Close']) / 3
-        data['CumulativeVolume'] = data['Volume'].cumsum()
-        data['CumulativePV'] = (data['TypicalPrice'] * data['Volume']).cumsum()
-
-        # Calculate VWAP
-        vwap = data['CumulativePV'].iloc[-1] / data['CumulativeVolume'].iloc[-1]
-
-        logging.info(f"Calculated VWAP for {symbol}: {vwap:.2f}")
-        return vwap
-
-    except Exception as e:
-        logging.error(f"Failed to calculate VWAP for {symbol}: {e}")
-        return None
 
 if __name__ == "__main__":
     setup_logging()
     logging.info("--- Starting Trading Bot ---")
-
-    # Check if it's a trading day (Monday to Friday)
-    if datetime.date.today().weekday() >= 5:
-        logging.info("Today is a weekend. The bot will not run.")
-    else:
+    if datetime.date.today().weekday() < 5:
         if login_to_kotak():
             logging.info("Successfully logged into Kotak Neo.")
-
-            # --- Schedule Jobs ---
-            # Schedule the entry strategy to run every minute after the ENTRY_TIME.
-            schedule.every(1).minutes.do(run_strategy).tag('entry-job')
-            # Schedule the exit strategy to run once at EXIT_TIME.
+            reset_bot_state()
+            schedule.every().day.at("09:16").do(initial_setup)
+            schedule.every(1).minutes.do(run_strategy)
             schedule.every().day.at(EXIT_TIME).do(square_off_positions)
-
-            logging.info(f"Bot is now running. Entry checks will start after {ENTRY_TIME}. Exit is scheduled for {EXIT_TIME}.")
-
-            # --- Main Loop ---
+            logging.info(f"Bot is now running. Data collection starts at {ENTRY_TIME}. Trading starts at {TRADING_START_TIME}. Exit is at {EXIT_TIME}.")
             while True:
-                # Get the current time in HH:MM format
-                current_time = datetime.datetime.now().strftime("%H:%M")
-
-                # Only start running jobs after the entry time
-                if current_time >= ENTRY_TIME:
+                if datetime.datetime.now().strftime("%H:%M") >= ENTRY_TIME:
                     schedule.run_pending()
-
-                # If the exit job has run and cancelled all jobs, break the loop
                 if not schedule.jobs:
                     break
-
-                time.sleep(1) # Sleep for a second to prevent high CPU usage
+                time.sleep(1)
         else:
             logging.error("Could not start trading bot due to login failure.")
-
+    else:
+        logging.info("Today is a weekend. The bot will not run.")
     logging.info("--- Trading Bot Shut Down ---")
