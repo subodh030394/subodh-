@@ -7,7 +7,7 @@ import logging
 import os
 from datetime import datetime
 import pandas as pd
-from neo_api_client import NeoAPI
+from neo_api_client import NeoAPI, BaseUrl
 import config
 
 # Setup logging
@@ -29,31 +29,39 @@ class KotakClient:
         Logs into the Kotak Neo API using credentials from the config file.
         """
         logging.info("Logging in...")
-        # Note: The user will need to handle the TOTP generation themselves.
-        # This script will prompt for it when run.
         try:
+            # Step 1: Generate the dynamic base URL required by the API
+            logging.info(f"Generating base URL for user '{config.ucc}'...")
+            base_url = BaseUrl(ucc=config.ucc).get_base_url()
+            if "Error" in base_url:
+                logging.error(f"Failed to generate base URL. Please check your UCC in config.py. API response: {base_url}")
+                raise ValueError("Base URL generation failed.")
+            logging.info("Base URL generated successfully.")
+
+            # Step 2: Initialize the client with the generated base URL
             self.client = NeoAPI(
                 consumer_key=config.consumer_key,
                 consumer_secret=config.consumer_secret,
-                environment='prod', # Use 'uat' for testing if available
-                neo_fin_key=config.neo_fin_key
+                environment='prod',
+                neo_fin_key=config.neo_fin_key,
+                base_url=base_url
             )
 
-            # The login flow requires TOTP, which needs to be entered manually.
+            # Step 3: Perform the TOTP-based login
             totp = input("Enter the TOTP from your authenticator app: ")
-            self.client.totp_login(
+            login_response = self.client.totp_login(
                 mobile_number=config.mobile_number,
                 ucc=config.ucc,
                 totp=totp
             )
 
-            # The second step is to validate with the trading password/MPIN
+            # Step 4: Validate the login with the trading password/MPIN
             self.client.totp_validate(config.password)
 
             self.logged_in = True
             logging.info("Login successful.")
         except Exception as e:
-            logging.error(f"Failed to log in: {e}")
+            logging.error(f"An exception occurred during login. Please check credentials in config.py and your TOTP. Details: {repr(e)}")
             self.logged_in = False
             raise
 
