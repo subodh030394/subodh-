@@ -42,7 +42,7 @@ EXIT_TIME = "15:00"
 # --- Global Variables ---
 client = None
 bot_state = {}
-price_data = pd.DataFrame(columns=['timestamp', 'combined_premium'])
+price_data = pd.DataFrame(columns=['timestamp', 'combined_premium', 'index_volume'])
 
 def reset_bot_state():
     """Initializes or resets the bot's state for the day."""
@@ -51,7 +51,7 @@ def reset_bot_state():
         "straddle_selected": False,
         "initial_entry_taken": False,
         "is_trading_window_open": False,
-        "premium_crossed_above_twap": False,
+        "premium_crossed_above_proxy_vwap": False,
 
         "call_instrument": None,
         "put_instrument": None,
@@ -67,7 +67,7 @@ def reset_bot_state():
 
         "entry_index_ltp": None,
     }
-    price_data = pd.DataFrame(columns=['timestamp', 'combined_premium'])
+    price_data = pd.DataFrame(columns=['timestamp', 'combined_premium', 'index_volume'])
     logging.info("Bot state has been reset for the day.")
 
 # --- Main Logic ---
@@ -97,15 +97,15 @@ def login_to_kotak():
 
 # --- Data and Instrument Functions ---
 
-def get_index_ltp(symbol):
-    """Fetches the Last Traded Price of the index from yfinance."""
+def get_index_data(symbol):
+    """Fetches the last 1-minute candle's closing price and volume for the index."""
     try:
         data = yf.Ticker(symbol).history(period="1d", interval="1m")
-        ltp = data['Close'].iloc[-1]
-        return ltp
+        last_candle = data.iloc[-1]
+        return last_candle['Close'], last_candle['Volume']
     except Exception as e:
-        logging.error(f"Could not fetch LTP for {symbol}: {e}")
-        return None
+        logging.error(f"Could not fetch index data for {symbol}: {e}")
+        return None, None
 
 def get_atm_strike(ltp):
     """Calculates the At-The-Money (ATM) strike price."""
@@ -165,7 +165,7 @@ def get_option_premiums(call_instrument, put_instrument):
 def initial_setup():
     """Runs once at the start of the session to determine the ATM straddle."""
     logging.info("--- Running Initial Setup for 9:16 AM ---")
-    ltp = get_index_ltp(INDEX_SYMBOL)
+    ltp, _ = get_index_data(INDEX_SYMBOL) # We don't need volume for the initial setup
     if ltp is None:
         logging.error("Could not get LTP to determine ATM strike. Setup failed.")
         return
@@ -180,25 +180,41 @@ def initial_setup():
     logging.info(f"Straddle selected: {bot_state['call_instrument']['symbol']} and {bot_state['put_instrument']['symbol']}")
     return schedule.CancelJob
 
-def update_and_calculate_twap():
+def update_and_calculate_proxy_vwap():
     """
-    Fetches premiums and calculates the TWAP for the straddle.
-    Note: TWAP (Time-Weighted Average Price) is used as a practical proxy for VWAP
-    (Volume-Weighted Average Price) because per-minute volume data for a combined,
-    synthetic instrument like a straddle is not readily available.
+    Fetches premiums and calculates the Proxy VWAP for the straddle.
+    Note: A proxy VWAP is calculated using the underlying index's volume as a stand-in
+    for the options' volume, as per-minute volume data for options is not available.
     """
     if not bot_state.get('straddle_selected'):
         return None, None, None, None
+
+    # Fetch option premiums
     call_premium, put_premium = get_option_premiums(bot_state['call_instrument'], bot_state['put_instrument'])
     if call_premium is None or put_premium is None:
         return None, None, None, None
+
+    # Fetch index volume as a proxy
+    _, index_volume = get_index_data(INDEX_SYMBOL)
+    if index_volume is None:
+        logging.warning("Could not get index volume. Using 1 as a neutral weight.")
+        index_volume = 1
+
     combined_premium = call_premium + put_premium
     global price_data
-    new_row = pd.DataFrame({'timestamp': [datetime.datetime.now()], 'combined_premium': [combined_premium]})
+    new_row = pd.DataFrame({
+        'timestamp': [datetime.datetime.now()],
+        'combined_premium': [combined_premium],
+        'index_volume': [index_volume]
+    })
     price_data = pd.concat([price_data, new_row], ignore_index=True)
-    premium_twap = price_data['combined_premium'].mean()
-    logging.info(f"Premiums C:{call_premium:.2f}, P:{put_premium:.2f} | Combined:{combined_premium:.2f} | TWAP:{premium_twap:.2f}")
-    return call_premium, put_premium, combined_premium, premium_twap
+
+    # Calculate the Proxy VWAP
+    price_volume = price_data['combined_premium'] * price_data['index_volume']
+    proxy_vwap = price_volume.sum() / price_data['index_volume'].sum()
+
+    logging.info(f"Premiums C:{call_premium:.2f}, P:{put_premium:.2f} | Combined:{combined_premium:.2f} | Proxy VWAP:{proxy_vwap:.2f}")
+    return call_premium, put_premium, combined_premium, proxy_vwap
 
 def place_order(trading_symbol, transaction_type):
     """Places a market order."""
@@ -215,23 +231,23 @@ def place_order(trading_symbol, transaction_type):
         logging.error(f"Exception placing {transaction_type} order for {trading_symbol}: {e}")
         return None
 
-def check_for_entry(call_premium, put_premium, combined_premium, premium_twap):
+def check_for_entry(call_premium, put_premium, combined_premium, proxy_vwap):
     """
     Checks and executes the entry logic based on Rules 3, 4, 12, 13.
     Note: The "on candle close" basis (Rule 13) is implemented by checking the state
     every minute. On a 1-minute timeframe, this is a robust and practical proxy.
     """
-    if not bot_state['premium_crossed_above_twap']:
-        if combined_premium > premium_twap:
-            bot_state['premium_crossed_above_twap'] = True
-            logging.info("Condition met: Premium crossed above TWAP. Now monitoring for an entry signal.")
+    if not bot_state['premium_crossed_above_proxy_vwap']:
+        if combined_premium > proxy_vwap:
+            bot_state['premium_crossed_above_proxy_vwap'] = True
+            logging.info("Condition met: Premium crossed above Proxy VWAP. Now monitoring for an entry signal.")
         else:
-            logging.info("Condition not met: Premium is still below TWAP. Waiting for it to cross above before entry.")
+            logging.info("Condition not met: Premium is still below Proxy VWAP. Waiting for it to cross above before entry.")
         return
 
-    if combined_premium < premium_twap:
-        logging.info(f"ENTRY SIGNAL: Premium ({combined_premium:.2f}) < TWAP ({premium_twap:.2f}).")
-        entry_ltp = get_index_ltp(INDEX_SYMBOL)
+    if combined_premium < proxy_vwap:
+        logging.info(f"ENTRY SIGNAL: Premium ({combined_premium:.2f}) < Proxy VWAP ({proxy_vwap:.2f}).")
+        entry_ltp, _ = get_index_data(INDEX_SYMBOL)
         if entry_ltp is None:
             logging.error("Could not get index LTP at entry. Cannot proceed with entry.")
             return
@@ -257,21 +273,21 @@ def calculate_legs_pnl(current_call_premium, current_put_premium):
     pnl["total"] = pnl["call"] + pnl["put"]
     return pnl
 
-def manage_open_positions(call_premium, put_premium, combined_premium, premium_twap):
+def manage_open_positions(call_premium, put_premium, combined_premium, proxy_vwap):
     """Manages open positions based on the user's rules."""
     pnl = calculate_legs_pnl(call_premium, put_premium)
     logging.info(f"P&L Check: Call P&L: {pnl['call']:.2f}, Put P&L: {pnl['put']:.2f}, Total P&L: {pnl['total']:.2f}")
 
     # Stop-Loss Logic (Rules 5, 6, 14)
-    if combined_premium > premium_twap:
+    if combined_premium > proxy_vwap:
         if pnl['total'] > STOP_LOSS_AMOUNT:
-            logging.info(f"Premium > TWAP, but loss ({pnl['total']:.2f}) is within threshold of {STOP_LOSS_AMOUNT}.")
+            logging.info(f"Premium > Proxy VWAP, but loss ({pnl['total']:.2f}) is within threshold of {STOP_LOSS_AMOUNT}.")
             return
 
-        logging.warning(f"STOP LOSS triggered. Premium > TWAP and P&L ({pnl['total']:.2f}) has breached {STOP_LOSS_AMOUNT}.")
+        logging.warning(f"STOP LOSS triggered. Premium > Proxy VWAP and P&L ({pnl['total']:.2f}) has breached {STOP_LOSS_AMOUNT}.")
 
         # Determine market direction to decide which leg to close (Rules 5 & 6)
-        current_ltp = get_index_ltp(INDEX_SYMBOL)
+        current_ltp, _ = get_index_data(INDEX_SYMBOL)
         entry_ltp = bot_state.get('entry_index_ltp')
 
         if current_ltp is None or entry_ltp is None:
@@ -291,16 +307,16 @@ def manage_open_positions(call_premium, put_premium, combined_premium, premium_t
             bot_state['put_leg_open'] = False
 
     # Re-entry Logic (Rule 7)
-    elif combined_premium < premium_twap:
+    elif combined_premium < proxy_vwap:
         if not bot_state['call_leg_open'] and not bot_state['call_re_entry_used']:
-            logging.info("RE-ENTRY signal for CALL leg. Premium has gone back below TWAP.")
+            logging.info("RE-ENTRY signal for CALL leg. Premium has gone back below Proxy VWAP.")
             new_call_price, _ = get_option_premiums(bot_state['call_instrument'], None)
             if new_call_price:
                 place_order(bot_state['call_instrument']['symbol'], 'S')
                 bot_state.update({"call_leg_open": True, "call_re_entry_used": True, "call_entry_price": new_call_price})
 
         if not bot_state['put_leg_open'] and not bot_state['put_re_entry_used']:
-            logging.info("RE-ENTRY signal for PUT leg. Premium has gone back below TWAP.")
+            logging.info("RE-ENTRY signal for PUT leg. Premium has gone back below Proxy VWAP.")
             _, new_put_price = get_option_premiums(None, bot_state['put_instrument'])
             if new_put_price:
                 place_order(bot_state['put_instrument']['symbol'], 'S')
@@ -315,7 +331,7 @@ def run_strategy():
         logging.info("Straddle not selected yet. Waiting for 9:16 AM setup.")
         return
 
-    call_premium, put_premium, combined_premium, premium_twap = update_and_calculate_twap()
+    call_premium, put_premium, combined_premium, proxy_vwap = update_and_calculate_proxy_vwap()
     if combined_premium is None:
         return
 
@@ -328,9 +344,9 @@ def run_strategy():
         return
 
     if bot_state.get('initial_entry_taken'):
-        manage_open_positions(call_premium, put_premium, combined_premium, premium_twap)
+        manage_open_positions(call_premium, put_premium, combined_premium, proxy_vwap)
     else:
-        check_for_entry(call_premium, put_premium, combined_premium, premium_twap)
+        check_for_entry(call_premium, put_premium, combined_premium, proxy_vwap)
 
 def square_off_positions():
     """Squares off any open positions and logs out."""
